@@ -1,0 +1,6 @@
+[workspace]
+members = [
+		"ink-extension/contract",
+		"ink-extension/runtime",
+		"xcm"
+]
