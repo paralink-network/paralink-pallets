@@ -429,5 +429,11 @@ fn submit_input_failures() {
             ParalinkFeedPallet::submit(Origin::signed(2), feed_id, value),
             Error::<Test>::NotFeedOwner
         );
+
+        Balances::make_free_balance_be(&alice, 9999);
+        assert_noop!(
+            ParalinkFeedPallet::submit(Origin::signed(alice), feed_id, value),
+            Error::<Test>::NotEnoughBalance
+        );
     });
 }

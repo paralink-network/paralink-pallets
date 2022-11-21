@@ -249,6 +249,11 @@ pub mod pallet {
             let mut feed = Self::feed_config(feed_id).ok_or(Error::<T>::FeedNotFound)?;
             ensure!(feed.owner == owner, Error::<T>::NotFeedOwner);
 
+            ensure!(
+                T::Currency::free_balance(&owner) >= T::FeedStakingBalance::get(),
+                Error::<T>::NotEnoughBalance
+            );
+
             let round_id = feed
                 .latest_round
                 .checked_add(One::one())
