@@ -4,12 +4,13 @@
 /// Learn more about FRAME and the core library of Substrate FRAME pallets:
 /// <https://docs.substrate.io/v3/runtime/frame>
 pub use pallet::*;
+use sp_std::prelude::*;
 
-#[cfg(test)]
-mod mock;
+//#[cfg(test)]
+//mod mock;
 
-#[cfg(test)]
-mod tests;
+//#[cfg(test)]
+//mod tests;
 
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
@@ -26,10 +27,14 @@ pub mod pallet {
     };
 
     use frame_system::pallet_prelude::*;
-
+    use frame_system::Config as SystemConfig;
     use sp_arithmetic::traits::BaseArithmetic;
-
     use sp_runtime::traits::{CheckedAdd, One, Zero};
+
+    // XCM
+    use cumulus_pallet_xcm::{ensure_sibling_para, Origin as CumulusOrigin};
+    use cumulus_primitives_core::ParaId;
+    use xcm::latest::prelude::*;
 
     #[pallet::pallet]
     #[pallet::generate_store(pub(super) trait Store)]
@@ -66,6 +71,20 @@ pub mod pallet {
 
         /// Information on runtime weights.
         type WeightInfo: WeightInfo;
+
+        /// XCM
+        /// The overarching call type; we assume sibling chains use the same type.
+        type Call: From<Call<Self>> + Encode;
+
+        type Origin: From<<Self as SystemConfig>::Origin>
+            + Into<Result<CumulusOrigin, <Self as Config>::Origin>>;
+
+        type XcmSender: SendXcm;
+
+        /// This is the trusted account to submit XCM messages
+        /// Depends on parachain ID, can be calculated here:
+        /// https://substrate.stackexchange.com/questions/1200/how-to-calculate-sovereignaccount-for-parachain/1210
+        type ParalinkSovereignAccount: Get<<Self as frame_system::Config>::AccountId>;
     }
 
     pub type RoundId = u64;
@@ -131,6 +150,12 @@ pub mod pallet {
         OptionQuery,
     >;
 
+    /// Parachains interested in price feeds (used on the paralink side)
+    #[pallet::storage]
+    #[pallet::getter(fn registered_parachains)]
+    pub(super) type RegisteredParachains<T: Config> =
+        StorageMap<_, Twox64Concat, ParaId, Vec<T::FeedId>, OptionQuery>;
+
     // Pallets use events to inform users when important changes are made.
     // https://docs.substrate.io/v3/runtime/events-and-errors
     #[pallet::event]
@@ -143,11 +168,44 @@ pub mod pallet {
         /// A feed creator was removed. \[creator\]
         FeedCreatorRemoved(T::AccountId),
         /// A feed was created with [\feed_id\] and [\creator\]
-        FeedCreated(T::FeedId, T::AccountId),
+        FeedCreated(
+            T::FeedId,
+            FeedConfig<T::AccountId, BoundedVec<u8, T::StringLimit>>,
+        ),
         /// A feed [\feed_id\] owner was updated [\new_owner\]
         OwnerUpdated(T::FeedId, T::AccountId),
         /// A feed [\feed_id\] value [\value\] was updated
         FeedValueUpdated(T::FeedId, T::Value),
+        XcmReceivedNewFeedSubscription(
+            ParaId,
+            T::FeedId,
+            FeedConfig<T::AccountId, BoundedVec<u8, T::StringLimit>>,
+            Round<T::BlockNumber, T::Value>,
+        ),
+        // An XCM feed was registered on the Paralink chain
+        XcmFeedRegistered(
+            ParaId,
+            T::FeedId,
+            FeedConfig<T::AccountId, BoundedVec<u8, T::StringLimit>>,
+        ),
+        /// The XCM feed was registered on Paralink chain
+        XcmFeedNotRegistered(
+            SendError,
+            ParaId,
+            T::FeedId,
+            FeedConfig<T::AccountId, BoundedVec<u8, T::StringLimit>>,
+        ),
+        XcmSendLatestValue(
+            ParaId,
+            Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)>,
+        ),
+        XcmErrorSendingLatestValue(
+            SendError,
+            ParaId,
+            Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)>,
+        ),
+        // A feed value was received from XCM
+        XcmReceiveLatestValue(ParaId, T::FeedId, RoundId, Round<T::BlockNumber, T::Value>),
     }
 
     // Errors inform users that something went wrong.
@@ -171,10 +229,11 @@ pub mod pallet {
         NoValue,
         /// The account does not hold enough balance to create/submit to feed
         NotEnoughBalance,
+        /// Register ParaId was not found
+        ParaIdNotFound,
+        /// The sending origin was not from the ParalinkSovereignAccount
+        NotParalinkSovereignAccount,
     }
-
-    #[pallet::hooks]
-    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {}
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
@@ -209,17 +268,15 @@ pub mod pallet {
             let new_id = id.checked_add(&One::one()).ok_or(Error::<T>::Overflow)?;
             FeedCounter::<T>::put(new_id);
 
-            Feeds::<T>::insert(
-                id,
-                FeedConfig {
-                    description,
-                    ipfs_hash,
-                    decimals,
-                    owner: owner.clone(),
-                    first_valid_round: None,
-                    latest_round: Zero::zero(),
-                },
-            );
+            let feed_config = FeedConfig {
+                description,
+                ipfs_hash,
+                decimals,
+                owner: owner.clone(),
+                first_valid_round: None,
+                latest_round: Zero::zero(),
+            };
+            Feeds::<T>::insert(id, feed_config.clone());
 
             let updated_at = frame_system::Pallet::<T>::block_number();
             Rounds::<T>::insert(
@@ -231,7 +288,7 @@ pub mod pallet {
                 },
             );
 
-            Self::deposit_event(Event::FeedCreated(id, owner));
+            Self::deposit_event(Event::FeedCreated(id, feed_config));
             Ok(().into())
         }
 
@@ -248,11 +305,6 @@ pub mod pallet {
 
             let mut feed = Self::feed_config(feed_id).ok_or(Error::<T>::FeedNotFound)?;
             ensure!(feed.owner == owner, Error::<T>::NotFeedOwner);
-
-            ensure!(
-                T::Currency::free_balance(&owner) >= T::FeedStakingBalance::get(),
-                Error::<T>::NotEnoughBalance
-            );
 
             let round_id = feed
                 .latest_round
@@ -366,6 +418,171 @@ pub mod pallet {
 
             Ok(().into())
         }
+
+        // XCM
+        #[pallet::weight(T::WeightInfo::register_feed_to_paralink())]
+        pub fn register_feed_to_paralink(
+            origin: OriginFor<T>,
+            para_id: ParaId,
+            feed_id: T::FeedId,
+        ) -> DispatchResult {
+            let owner = ensure_signed(origin)?;
+            ensure!(
+                FeedCreators::<T>::contains_key(&owner),
+                Error::<T>::NotFeedCreator
+            );
+            let feed_config = Feeds::<T>::get(feed_id).ok_or(Error::<T>::FeedNotFound)?;
+            let round = Rounds::<T>::get(feed_id, feed_config.latest_round).unwrap_or_else(|| {
+                debug_assert!(false, "The latest round should be available.");
+                Round::default()
+            });
+
+            log::info!(
+                "***** Paralink XCM register_feed_to_paralink to para_id: {:?},  feed: {:?}",
+                para_id,
+                feed_id,
+            );
+            match T::XcmSender::send_xcm(
+                (1, Junction::Parachain(para_id.into())),
+                Xcm(vec![Transact {
+                    origin_type: OriginKind::Native,
+                    require_weight_at_most: 2_000_000_000,
+                    call: <T as Config>::Call::from(Call::<T>::receive_new_feed {
+                        feed_id: feed_id.clone(),
+                        feed_config: feed_config.clone(),
+                        latest_round: round,
+                    })
+                    .encode()
+                    .into(),
+                }]),
+            ) {
+                Ok(()) => {
+                    if RegisteredParachains::<T>::get(para_id).is_none() {
+                        RegisteredParachains::<T>::insert(para_id, Vec::<T::FeedId>::new());
+                    }
+
+                    let mut vec = RegisteredParachains::<T>::get(para_id)
+                        .ok_or(Error::<T>::ParaIdNotFound)?;
+                    vec.push(feed_id);
+                    RegisteredParachains::<T>::insert(para_id, vec);
+
+                    Self::deposit_event(Event::XcmFeedRegistered(para_id, feed_id, feed_config));
+                }
+                Err(e) => Self::deposit_event(Event::XcmFeedNotRegistered(
+                    e,
+                    para_id,
+                    feed_id,
+                    feed_config,
+                )),
+            }
+
+            log::info!("***** Paralink XCM send_latest_data_through_xcm exited");
+
+            Ok(())
+        }
+
+        #[pallet::weight(T::WeightInfo::receive_new_feed())]
+        pub fn receive_new_feed(
+            origin: OriginFor<T>,
+            feed_id: T::FeedId,
+            feed_config: FeedConfig<T::AccountId, BoundedVec<u8, T::StringLimit>>,
+            latest_round: Round<T::BlockNumber, T::Value>,
+        ) -> DispatchResult {
+            log::info!("***** Paralink XCM receive_new_feed called");
+            let para_id = ensure_sibling_para(<T as Config>::Origin::from(origin.clone()))?;
+            log::info!("***** Paralink XCM para called, para = {:?}", para_id);
+            let signer = ensure_signed(origin.clone())?;
+
+            log::info!("***** Paralink XCM para called, para = {:?}", para_id);
+
+            log::info!(
+                    "***** BEFORE Paralink XCM Received latest_feed_config = {:?}, round = {:?}, signer = {:?}, sovereign = {:?}",
+                    feed_config.clone(),
+                    latest_round.clone(),
+                    signer,
+                    T::ParalinkSovereignAccount::get()
+            );
+
+            ensure!(
+                signer == T::ParalinkSovereignAccount::get(),
+                Error::<T>::NotParalinkSovereignAccount
+            );
+
+            log::info!(
+                "***** Paralink XCM Received latest_feed_config = {:?}, round = {:?}",
+                feed_config.clone(),
+                latest_round.clone()
+            );
+
+            Feeds::<T>::insert(feed_id, feed_config.clone());
+            Rounds::<T>::insert(feed_id, feed_config.latest_round, latest_round.clone());
+
+            // Register the feed, so we can retrieve it on the consumer chain
+            if RegisteredParachains::<T>::get(para_id).is_none() {
+                RegisteredParachains::<T>::insert(para_id, Vec::<T::FeedId>::new());
+            }
+
+            let mut vec =
+                RegisteredParachains::<T>::get(para_id).ok_or(Error::<T>::ParaIdNotFound)?;
+            vec.push(feed_id);
+            RegisteredParachains::<T>::insert(para_id, vec);
+
+            Self::deposit_event(Event::XcmReceivedNewFeedSubscription(
+                para_id,
+                feed_id,
+                feed_config,
+                latest_round,
+            ));
+            Ok(())
+        }
+
+        #[pallet::weight(T::WeightInfo::receive_latest_data())]
+        pub fn receive_latest_data(
+            origin: OriginFor<T>,
+            data: Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)>,
+        ) -> DispatchResult {
+            log::info!("***** Paralink XCM receive_latest_data called");
+            let para_id = ensure_sibling_para(<T as Config>::Origin::from(origin.clone()))?;
+            let signer = ensure_signed(origin.clone())?;
+
+            ensure!(
+                signer == T::ParalinkSovereignAccount::get(),
+                Error::<T>::NotParalinkSovereignAccount
+            );
+
+            log::info!(
+                "***** Paralink XCM Received latest_data = {:?}",
+                data.clone()
+            );
+
+            for (feed_id, round_id, round) in data.iter() {
+                let feed = Feeds::<T>::get(feed_id.clone());
+
+                if let Some(mut feed_config) = feed {
+                    feed_config.latest_round = round_id.clone();
+
+                    if feed_config.first_valid_round.is_none() {
+                        feed_config.first_valid_round = Some(round_id.clone());
+                    }
+
+                    Feeds::<T>::insert(feed_id, feed_config.clone());
+                    Rounds::<T>::insert(feed_id, feed_config.latest_round, round);
+
+                    Self::deposit_event(Event::XcmReceiveLatestValue(
+                        para_id,
+                        feed_id.clone(),
+                        round_id.clone(),
+                        round.clone(),
+                    ));
+                } else {
+                    log::info!(
+                        "***** Paralink XCM receive_latest_data no feed found = {:?}",
+                        data.clone()
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
@@ -383,6 +600,89 @@ pub mod pallet {
                     Round::default()
                 });
                 Ok(round)
+            }
+        }
+
+        fn send_latest_data_through_xcm(
+            para_id: ParaId,
+            data: Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)>,
+        ) {
+            log::info!(
+                "***** Paralink XCM send_latest_data_through_xcm called para_id: {:?},  data {:?}",
+                para_id,
+                data
+            );
+            match T::XcmSender::send_xcm(
+                (1, Junction::Parachain(para_id.into())),
+                Xcm(vec![Transact {
+                    origin_type: OriginKind::Native,
+                    require_weight_at_most: 2_000_000_000,
+                    call: <T as Config>::Call::from(Call::<T>::receive_latest_data {
+                        data: data.clone(),
+                    })
+                    .encode()
+                    .into(),
+                }]),
+            ) {
+                Ok(()) => Self::deposit_event(Event::XcmSendLatestValue(para_id, data)),
+                Err(e) => Self::deposit_event(Event::XcmErrorSendingLatestValue(e, para_id, data)),
+            }
+
+            log::info!("***** Paralink XCM send_latest_data_through_xcm exited");
+        }
+    }
+
+    // XCM
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+        fn on_finalize(_n: T::BlockNumber) {
+            for (para_id, feeds) in RegisteredParachains::<T>::iter() {
+                let mut data: Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)> =
+                    Vec::new();
+                for feed_id in feeds.iter() {
+                    let feed_config = Feeds::<T>::get(feed_id.clone());
+                    if feed_config.is_none() {
+                        log::error!(
+                            "***** Paralink XCM on_finalize - no feed config found for para_id/feed_id: {:?}, {:?}",
+                            para_id,
+                            feed_id
+                        );
+                        continue;
+                    }
+                    if T::Currency::free_balance(&feed_config.clone().unwrap().owner)
+                        < T::FeedStakingBalance::get()
+                    {
+                        log::error!(
+                            "***** Paralink XCM on_finalize - not enough staking balance found for para_id/feed_id: {:?}, {:?}, available balance: {:?},/{:?}",
+                            para_id,
+                            feed_id,
+                            T::Currency::free_balance(&feed_config.clone().unwrap().owner),
+                            T::FeedStakingBalance::get()
+                        );
+                        continue;
+                    }
+
+                    let feed_round = Self::latest_value(feed_id.clone());
+                    match feed_round {
+                        Err(e) => {
+                            log::error!(
+                            "***** Paralink XCM on_finalize - no feed round found for para_id/feed_id: {:?}, {:?}, error: {:?}",
+                            para_id,
+                            feed_id,
+                            e
+                        );
+                            continue;
+                        }
+                        Ok(round) => {
+                            if let Some(feed) = feed_config {
+                                data.push((feed_id.clone(), feed.latest_round, round));
+                            }
+                        }
+                    }
+                }
+                if !data.is_empty() {
+                    Self::send_latest_data_through_xcm(para_id, data);
+                }
             }
         }
     }
@@ -444,5 +744,8 @@ pub mod pallet {
         fn transfer_pallet_admin() -> Weight;
         fn add_feed_creator() -> Weight;
         fn remove_feed_creator() -> Weight;
+        fn receive_latest_data() -> Weight;
+        fn receive_new_feed() -> Weight;
+        fn register_feed_to_paralink() -> Weight;
     }
 }
