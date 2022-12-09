@@ -21,7 +21,7 @@ pub mod weights;
 pub mod pallet {
     use super::*;
     use frame_support::{
-        dispatch::{DispatchResultWithPostInfo, HasCompact},
+        dispatch::{DispatchResultWithPostInfo, Dispatchable, HasCompact, PostDispatchInfo},
         pallet_prelude::{OptionQuery, *},
         traits::{Currency, ReservableCurrency},
     };
@@ -74,17 +74,21 @@ pub mod pallet {
 
         /// XCM
         /// The overarching call type; we assume sibling chains use the same type.
-        type Call: From<Call<Self>> + Encode;
+        type Call: From<Call<Self>>
+            + Encode
+            + Dispatchable<Origin = <Self as Config>::Origin, PostInfo = PostDispatchInfo>;
 
         type Origin: From<<Self as SystemConfig>::Origin>
             + Into<Result<CumulusOrigin, <Self as Config>::Origin>>;
 
         type XcmSender: SendXcm;
 
-        /// This is the trusted account to submit XCM messages
-        /// Depends on parachain ID, can be calculated here:
+        /// This is the trusted ParaID to submit XCM messages
+        /// Sovereign account can be calculated here:
         /// https://substrate.stackexchange.com/questions/1200/how-to-calculate-sovereignaccount-for-parachain/1210
-        type ParalinkSovereignAccount: Get<<Self as frame_system::Config>::AccountId>;
+        type ParalinkParaId: Get<ParaId>;
+
+        type SelfParaId: Get<ParaId>;
     }
 
     pub type RoundId = u64;
@@ -490,21 +494,17 @@ pub mod pallet {
         ) -> DispatchResult {
             log::info!("***** Paralink XCM receive_new_feed called");
             let para_id = ensure_sibling_para(<T as Config>::Origin::from(origin.clone()))?;
-            log::info!("***** Paralink XCM para called, para = {:?}", para_id);
-            let signer = ensure_signed(origin.clone())?;
-
-            log::info!("***** Paralink XCM para called, para = {:?}", para_id);
+            log::info!("***** Paralink XCM para called, para = {:?}", para_id,);
 
             log::info!(
-                    "***** BEFORE Paralink XCM Received latest_feed_config = {:?}, round = {:?}, signer = {:?}, sovereign = {:?}",
+                    "***** BEFORE Paralink XCM Received latest_feed_config = {:?}, round = {:?}, sovereign = {:?}",
                     feed_config.clone(),
                     latest_round.clone(),
-                    signer,
-                    T::ParalinkSovereignAccount::get()
+                    T::ParalinkParaId::get()
             );
 
             ensure!(
-                signer == T::ParalinkSovereignAccount::get(),
+                para_id == T::ParalinkParaId::get(),
                 Error::<T>::NotParalinkSovereignAccount
             );
 
@@ -543,10 +543,10 @@ pub mod pallet {
         ) -> DispatchResult {
             log::info!("***** Paralink XCM receive_latest_data called");
             let para_id = ensure_sibling_para(<T as Config>::Origin::from(origin.clone()))?;
-            let signer = ensure_signed(origin.clone())?;
 
+            log::info!("***** Paralink XCM para called, para = {:?}", para_id,);
             ensure!(
-                signer == T::ParalinkSovereignAccount::get(),
+                para_id == T::ParalinkParaId::get(),
                 Error::<T>::NotParalinkSovereignAccount
             );
 
@@ -636,6 +636,10 @@ pub mod pallet {
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         fn on_finalize(_n: T::BlockNumber) {
+            if T::SelfParaId::get() != T::ParalinkParaId::get() {
+                return;
+            }
+
             for (para_id, feeds) in RegisteredParachains::<T>::iter() {
                 let mut data: Vec<(T::FeedId, RoundId, Round<T::BlockNumber, T::Value>)> =
                     Vec::new();

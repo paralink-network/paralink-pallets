@@ -1738,6 +1738,7 @@ dependencies = [
  "serde",
  "sp-arithmetic",
  "sp-core",
+ "sp-debug-derive",
  "sp-io",
  "sp-runtime",
  "sp-std",
