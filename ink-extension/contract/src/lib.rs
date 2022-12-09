@@ -21,6 +21,12 @@ pub struct RoundData {
 	pub answered_in_round: u32,
 }
 
+pub struct Round<BlockNumber, Value> {
+	pub answer: Option<Value>,
+	pub updated_at: Option<BlockNumber>,
+}
+
+
 #[ink::chain_extension]
 pub trait ParalinkExtension {
 	type ErrorCode = ParalinkError;
