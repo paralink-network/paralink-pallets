@@ -2,5 +2,6 @@
 members = [
 		"ink-extension/contract",
 		"ink-extension/runtime",
+		"feeds",
 		"xcm"
 ]
